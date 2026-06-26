@@ -1,8 +1,8 @@
 """
 Agent Runtime — 24/7 background process for AI agents.
 
-Phase 2: L3 task delegation, watchdog health checks, agent collaboration,
-         condition-triggered pipelines, cron scheduling, and web dashboard.
+Phase 3: Plugin marketplace, cross-server federation, L4 payments,
+         enterprise RBAC, audit export, and SSO hooks.
 
 Quickstart:
     from agent_runtime import Runtime
@@ -14,7 +14,7 @@ Quickstart:
         password="***",
         permission_level=1,
     )
-    await rt.start()
+    await rt.start(enable_dashboard=True)
     # Agent is now 24/7 online
 """
 
@@ -34,6 +34,10 @@ from .watchdog import Watchdog, CheckResult, CheckStatus
 from .task_manager import TaskManager, Task, TaskStatus, TaskPriority
 from .collaboration import CollaborationManager, CollaborationSession, NegotiationPhase
 from .dashboard import DashboardServer
+from .marketplace import PluginMarketplace, PluginInfo
+from .federation import FederationManager, AgentNode, FederationConfig
+from .payments import PaymentManager, PaymentRequest, PaymentStatus, Currency
+from .enterprise import EnterpriseManager, RBACManager, AuditExporter, SSOManager, Role, User
 
 logger = logging.getLogger("agent-runtime")
 
@@ -43,11 +47,11 @@ try:
 except ImportError:
     ArmpAgent = None
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 
 class Runtime:
-    """Agent Runtime — keeps an AI agent 24/7 online with Phase 2 capabilities.
+    """Agent Runtime — keeps an AI agent 24/7 online with full Phase 3 capabilities.
 
     Parameters
     ----------
@@ -94,6 +98,12 @@ class Runtime:
         self.collaboration = CollaborationManager(self)
         self.dashboard = DashboardServer(self)
 
+        # Phase 3 subsystems
+        self.marketplace = PluginMarketplace(self)
+        self.federation = FederationManager(self)
+        self.payments = PaymentManager(self)
+        self.enterprise = EnterpriseManager(self)
+
         # ARMP agent (lazy init)
         self._armp: Optional["ArmpAgent"] = None
         self._started = False
@@ -114,13 +124,19 @@ class Runtime:
 
     # ── Lifecycle ─────────────────────────────────────
 
-    async def start(self, enable_dashboard: bool = False):
+    async def start(
+        self,
+        enable_dashboard: bool = False,
+        enable_federation: bool = False,
+    ):
         """Connect to Matrix and start 24/7 operation.
 
         Parameters
         ----------
         enable_dashboard : bool
-            Start the FastAPI web dashboard (default: False)
+            Start the FastAPI web dashboard.
+        enable_federation : bool
+            Enable cross-server agent discovery.
         """
         if self._started:
             logger.warning("Runtime already started")
@@ -142,7 +158,7 @@ class Runtime:
         await self._armp.start()
         logger.info(f"ARMP agent online: {self._armp.user_id}")
 
-        # 2. Start trigger engine (now includes cron scheduler)
+        # 2. Start trigger engine (includes cron scheduler)
         await self.triggers.start()
 
         # 3. Register message handler
@@ -151,17 +167,22 @@ class Runtime:
         # 4. Load plugins
         await self.plugins.load_all()
 
-        # 5. Start dashboard (optional)
+        # 5. Phase 3: start federation
+        if enable_federation:
+            await self.federation.start()
+
+        # 6. Start dashboard (optional)
         if enable_dashboard:
             await self.dashboard.start()
 
-        # 6. Send startup notification
+        # 7. Send startup notification
         await self.notifier.notify(
             f"🟢 Agent Runtime v{__version__} started\n"
             f"DID: {self.did}\n"
             f"Permission: L{self.permissions.level}\n"
             f"Matrix: {self._armp.user_id}\n"
-            f"Dashboard: {'enabled' if enable_dashboard else 'disabled'}",
+            f"Dashboard: {'enabled' if enable_dashboard else 'disabled'}\n"
+            f"Federation: {'enabled' if enable_federation else 'disabled'}",
             severity="info",
         )
 
@@ -175,6 +196,7 @@ class Runtime:
 
         await self.notifier.notify("🔴 Agent Runtime stopped", severity="info")
         await self.triggers.stop()
+        await self.federation.stop()
         await self.dashboard.stop()
 
         if self._armp:
@@ -190,16 +212,13 @@ class Runtime:
         if not self._started:
             return
 
-        # 1. Permission check
         if not self.permissions.can_handle_messages():
             logger.debug(f"Message ignored — L{self.permissions.level} lacks message permission")
             return
 
-        # 2. Decision engine
         intent = await self.decision.classify(message)
         action = self.decision.decide(intent, self.permissions.level)
 
-        # 3. Execute action
         if action == Action.IGNORE:
             return
         elif action == Action.NOTIFY:
@@ -230,19 +249,16 @@ class Runtime:
                     severity="warn",
                 )
 
-        # 4. Invoke plugins
         await self.plugins.on_message(message, intent)
 
-        # 5. Phase 2: check for collaboration messages
         if hasattr(message, 'sender'):
             collab_result = await self.collaboration.handle_collaboration_message(
                 message.body, message.sender
             )
             if collab_result:
-                logger.debug(f"Collaboration message processed: {collab_result.get('action')}")
+                logger.debug(f"Collaboration message: {collab_result.get('action')}")
 
     async def _generate_reply(self, message, intent: Intent) -> Optional[str]:
-        """Generate an automatic reply."""
         if intent == Intent.GREETING:
             return f"Hello! I'm {self.did}. My human is offline. I'll notify them of your message."
         elif intent == Intent.QUESTION:
@@ -256,68 +272,47 @@ class Runtime:
         return None
 
     async def _handle_api_call(self, message, intent: Intent):
-        """Handle an API-level request."""
         if not self.permissions.is_api_whitelisted(intent.api_name or ""):
             logger.warning(f"API '{intent.api_name}' not in whitelist")
             return
 
         result = await self.plugins.call_api(intent.api_name, intent.params)
         if result:
-            await self._armp.send_message(
-                message.room_id,
-                f"Result: {result[:500]}",
-            )
+            await self._armp.send_message(message.room_id, f"Result: {result[:500]}")
 
     async def _handle_delegation(self, message, intent: Intent):
-        """Handle a delegation request: create a task and delegate it."""
         task = await self.task_manager.create(
             title=f"Delegated: {message.body[:80]}",
             description=message.body,
             capability=intent.api_name or "general",
             parameters=intent.params,
-            deadline="",  # No deadline unless specified
         )
         await self.notifier.notify(
-            f"📋 Task created from delegation: {task.task_id}\n"
-            f"Message: {message.body[:100]}",
+            f"📋 Task created: {task.task_id}\nMessage: {message.body[:100]}",
             severity="info",
         )
-        # Auto-delegate if assignee is implied
         if task.assignee_did:
             await self.task_manager.delegate(task.task_id, task.assignee_did)
 
-    # ── Plugin Registration ───────────────────────────
-
     def register_plugin(self, name: str, plugin):
-        """Register a plugin."""
         self.plugins.register(name, plugin)
 
-    # ── User API ─────────────────────────────────────
-
     async def on_event(self, callback: Callable[..., Awaitable]):
-        """Register a callback for runtime events.
-
-        Events: message_received, trigger_fired, permission_denied,
-                task_created, task_delegated, watchdog_alert, collaboration_started,
-                error
-        """
         self._callback = callback
 
     async def upgrade_permission(self, level: int) -> bool:
-        """Request permission level upgrade."""
         if not 0 <= level <= 4:
             raise ValueError(f"Invalid permission level: {level}")
         if level == self.permissions.level:
             return True
 
-        # L3→L4 requires explicit confirmation (Phase 3)
         if level == 4 and self.permissions.level < 4:
             logger.warning("L4 upgrade requested — requires secondary confirmation")
 
         old = self.permissions.level
         self.permissions.level = level
         self.storage.log_event("permission_change", {
-            "from": old, "to": level, "timestamp": self._now_iso()
+            "from": old, "to": level, "timestamp": _now_iso()
         })
 
         await self.notifier.notify(
@@ -327,36 +322,35 @@ class Runtime:
         logger.info(f"Permission: L{old} → L{level}")
         return True
 
-    def _now_iso(self) -> str:
-        from datetime import datetime, timezone
-        return datetime.now(timezone.utc).isoformat()
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
 
 
 # ── Demo ────────────────────────────────────────────
 
 async def demo():
-    """Demonstrate Agent Runtime Phase 2 capabilities."""
-    print("🚀 Agent Runtime v0.2.0 — Phase 2 Demo\n")
+    """Demonstrate Agent Runtime Phase 3 capabilities."""
+    print("🚀 Agent Runtime v0.3.0 — Phase 3 Demo\n")
 
     rt = Runtime(
         did="AGNT-DEMO-001",
         homeserver="https://armp-group.org",
         username="demo-agent",
-        password="demo",
-        permission_level=2,
+        permission_level=3,
     )
 
     print(f"Runtime: {rt.did}")
     print(f"Version: v{__version__}")
     print(f"Permission: L{rt.permissions.level}")
-    print(f"Storage: {rt.storage.db_path}")
     print(f"Plugins: {len(rt.plugins.list())}")
-    print(f"Triggers: {len(rt.triggers.list())}")
-    print(f"Watchdog checks: {len(rt.watchdog._checks)}")
-    print(f"Task manager: ready")
-    print(f"Collaboration: ready")
+    print(f"Marketplace: {len(rt.marketplace._registry)} in registry")
+    print(f"Federation: {rt.federation.config.enabled}")
+    print(f"Payments: L4 secure with confirmation")
+    print(f"Enterprise: RBAC + audit export + SSO")
     print(f"Dashboard: ready (call start(enable_dashboard=True))")
-    print("\n── Phase 2 Demo Complete ──\n")
+    print("\n── Phase 3 Demo Complete ──\n")
 
 
 if __name__ == "__main__":
